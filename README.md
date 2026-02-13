@@ -163,6 +163,9 @@ print(output_df.head())
 3. Connect your repository
 4. Deploy!
 
+### The app is available on the URL:
+https://portfolio-performance-calculator-nzrv6wlxqgwuqzwingua56.streamlit.app/
+
 ### Run on Server
 
 ```bash
