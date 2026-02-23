@@ -118,7 +118,7 @@ def accumulated_holdings_data(filtered_transactions):
     return accumulated_holding
 
 
-def fill_portfolio_dates(df, end_date):
+def fill_portfolio_dates(df, end_date, add_ax_suffix=True):
     """
     Fill in missing dates in portfolio data
     
@@ -128,6 +128,8 @@ def fill_portfolio_dates(df, end_date):
         DataFrame with 'Date' column and holding or price columns
     end_date : str or datetime
         End date to fill up to
+    add_ax_suffix: Boolean
+        to add .AX to the ticker if it is ASX listed, by default it is true
     
     Returns:
     --------
@@ -162,8 +164,11 @@ def fill_portfolio_dates(df, end_date):
     df_filled = df_filled.rename(columns={'index': 'Date'})
     
     # To add .AX suffix to holdings data so the column names match exactly between holdings and market prices
-    df_filled = df_filled.rename(
-    columns=lambda x: f'{x}.AX' if (x != 'Date' and not x.endswith('.AX')) else x)
+    if add_ax_suffix:
+        df_filled = df_filled.rename(
+            columns=lambda x: f'{x}.AX' if (x != 'Date' and not x.endswith('.AX')) else x
+        )
+
     return df_filled
     
 
