@@ -336,6 +336,9 @@ def benchmark_data(filled_close_prices, filtered_transactions, benchmark_ticker=
         bmark_filled['benchmark_market_value_beginning']
     )
 
+    #Fix the first row as we assume the benchmark is purchased at market close price, so the return on day 1 is 0, without this step, might have -inf as return
+    bmark_filled.loc[bmark_filled['benchmark_market_value_beginning'] == 0, 'benchmark_returns'] = 0
+    
     # Add cumulative return column
     bmark_filled['cumulative_return'] = (1 + bmark_filled['benchmark_returns']).cumprod() - 1
     
