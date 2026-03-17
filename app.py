@@ -132,6 +132,8 @@ if uploaded_file is not None and run_analysis:
             st.header("📊 Portfolio Value Over Time")
 
             fig_value = go.Figure()
+
+            # Portfolio market values
             fig_value.add_trace(go.Scatter(
                 x=output_df['Date'],
                 y=output_df['Market_Value_End'],
@@ -141,15 +143,51 @@ if uploaded_file is not None and run_analysis:
                 fill='tozeroy',
                 fillcolor='rgba(31, 119, 180, 0.2)'
             ))
+            # NEW — simple cumulative cost (no time value)
+            fig_value.add_trace(go.Scatter(
+                x=output_df['Date'],
+                y=output_df['cumulative_cost'],
+                mode='lines',
+                name='Cost Basis (no time value)',
+                line=dict(color='#d62728', width=1.5, dash='dash'),
+            ))
+ 
+            # NEW — time-value adjusted cost
+            fig_value.add_trace(go.Scatter(
+                x=output_df['Date'],
+                y=output_df['tv_adjusted_cost'],
+                mode='lines',
+                name=f'Cost Basis (@ {risk_free_rate * 100:.2f}% p.a. risk-free)',
+                line=dict(color='#ff7f0e', width=1.5, dash='dot'),
+            ))
+ 
             fig_value.update_layout(
-                title='Portfolio Market Value',
+                title='Portfolio Market Value vs Cost Basis',
                 xaxis_title='Date',
                 yaxis_title='Market Value ($)',
                 hovermode='x unified',
                 template='plotly_white',
-                height=500
+                height=500,
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
             )
+ 
             st.plotly_chart(fig_value, use_container_width=True)
+ 
+            # NEW — explanation expander
+            with st.expander("ℹ️ How are the cost basis lines calculated?"):
+                st.markdown(f"""
+                **Cost Basis (no time value)** *(red dashed)*  
+                Running cumulative sum of all net cash flows — every buy adds to this line,
+                every sale reduces it. Shows net capital deployed at any point in time.
+ 
+                **Cost Basis (@ {risk_free_rate * 100:.2f}% p.a. risk-free)** *(orange dotted)*  
+                Each cash flow compounded forward at the risk-free rate
+                ({risk_free_rate * 100:.2f}% p.a., daily compounding) from the day it was
+                invested to each subsequent date. This is the opportunity cost — what your
+                deployed capital would have grown to in a risk-free instrument.  
+                **Your portfolio needs to stay above this line to have beaten the risk-free rate.**
+                """)
+ 
 
             # ── NEW ──────────────────────────────────────────────────────────
             # SECTION 3: PORTFOLIO VS BENCHMARK CUMULATIVE RETURN CHART

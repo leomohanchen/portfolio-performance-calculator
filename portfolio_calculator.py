@@ -576,6 +576,68 @@ def calculate_ratios(output, bmark_filled, alpha, beta, risk_free_rate=0.0529):
         'ann_residual_vol':     ann_residual_vol,
     }
 
+# =============================================================================
+# NEW FUNCTION — add anywhere before run_full_analysis
+# =============================================================================
+def calculate_cost_basis(output_df, annual_rfr):
+    """
+    Append two cost-basis columns to the portfolio output dataframe.
+ 
+    1. cumulative_cost  — simple running sum of net cash flows.
+                          Positive flow = money deployed (buy),
+                          negative flow = proceeds returned (sell).
+                          Represents net capital at risk at any point in time.
+ 
+    2. tv_adjusted_cost — each cash flow compounded forward at the risk-free rate
+                          from the day it occurred to each valuation date.
+                          Formula mirrors Excel: cash_flow * (1 + annual_rfr/365)^days
+                          where days = valuation_date - cash_flow_date.
+                          Represents the opportunity cost: what the deployed capital
+                          would have grown to in a risk-free instrument.
+                          Portfolio must stay above this line to have beaten the
+                          risk-free rate.
+ 
+    Parameters
+    ----------
+    output_df : pd.DataFrame
+        Output from calculate_portfolio_value.
+        Must contain 'Date' and 'net_cash_flow' columns.
+    annual_rfr : float
+        Annual risk-free rate as a decimal (e.g. 0.0435 for 4.35 %).
+ 
+    Returns
+    -------
+    pd.DataFrame
+        Same dataframe with two extra columns appended:
+        'cumulative_cost' and 'tv_adjusted_cost'.
+    """
+    df = output_df.copy().sort_values('Date').reset_index(drop=True)
+ 
+    cash_flows = df['net_cash_flow'].to_numpy()
+    dates = df['Date'].to_numpy()
+    n = len(df)
+ 
+    # --- 1. Simple cumulative cost ---
+    df['cumulative_cost'] = np.cumsum(cash_flows)
+ 
+    # --- 2. Time-value adjusted cost (vectorised) ---
+    # For each valuation date i, compound every prior cash flow j forward using:
+    #   cash_flow[j] * (1 + annual_rfr)^(days/365)
+    # where days = date[i] - date[j].
+    # This uses true compound interest: the growth factor scales continuously
+    # with the fraction of a year elapsed, rather than simple r/365 scaling.
+    ts = pd.to_datetime(dates)
+    day_matrix = np.array(
+        [[(ts[i] - ts[j]).days if i >= j else 0 for j in range(n)] for i in range(n)],
+        dtype=float
+    )
+    # (1 + r)^(days/365) — naturally gives 1.0 on the diagonal where days == 0
+    compound_matrix = np.tril((1 + annual_rfr) ** (day_matrix / 365))
+ 
+    df['tv_adjusted_cost'] = compound_matrix @ cash_flows
+ 
+    return df
+
 def calculate_performance_metrics(output_df):
     """
     Calculate TWRR metrics from the output dataframe
@@ -736,4 +798,8 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         risk_free_rate=risk_free_rate
     )
 
+    # ── NEW: append cost-basis columns to output before returning ──────────
+    output = calculate_cost_basis(output, risk_free_rate)
+    # ── END NEW ────────────────────────────────────────────────────────────
+ 
     return output, metrics, bmark_filled, regression, ratios
