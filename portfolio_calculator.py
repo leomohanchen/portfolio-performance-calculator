@@ -675,6 +675,128 @@ def calculate_performance_metrics(output_df):
         'days': days
     }
 
+def calculate_drawdown(output_df):
+    """
+    Calculate drawdown metrics from the portfolio cumulative return series.
+    Two outputs are returned:
+    1. episodes_df — every distinct drawdown episode with:
+       - Peak Date, Trough Date, Recovery Date (None if still underwater)
+       - Max Drawdown (simple subtraction in return space: peak_return - trough_return)
+       - Drawdown Length (days, peak to trough)
+       - Recovery Duration (days, trough to recovery; None if unrecovered)
+       - Total Duration (days, peak to recovery; None if unrecovered)
+    2. global_dd — a single dict for the global peak-to-trough drawdown:
+       - Same fields as above, derived from the single highest cumulative return
+         and the minimum cumulative return strictly after that peak date.
+    Parameters
+    ----------
+    output_df : pd.DataFrame
+        Output from calculate_portfolio_value / run_full_analysis.
+        Must contain 'Date' and 'cumulative_return' columns.
+    Returns
+    -------
+    episodes_df : pd.DataFrame
+        All drawdown episodes (rows), sorted chronologically.
+    global_dd : dict
+        Single global peak-to-trough summary.
+    """
+    df = output_df[['Date', 'cumulative_return']].copy()
+    df['Date'] = pd.to_datetime(df['Date'])
+    df = df.sort_values('Date').reset_index(drop=True)
+    # Drop any rows where cumulative_return is NaN (e.g. non-trading days or
+    # data gaps). NaN CRI values cause idxmax/idxmin on slices to return NaT
+    # instead of a valid integer index, which breaks the '<' comparison in the
+    # episode loop with a TypeError.
+    df = df.dropna(subset=['cumulative_return']).reset_index(drop=True)
+    # Work in index form internally so running-peak logic is clean,
+    # but report drawdown as simple return-space subtraction (your convention).
+    df['CRI'] = 1 + df['cumulative_return']
+    # -------------------------------------------------------------------------
+    # 1. Global peak-to-trough
+    # -------------------------------------------------------------------------
+    peak_idx  = df['CRI'].idxmax()
+    peak_date = df.loc[peak_idx, 'Date']
+    peak_ret  = df.loc[peak_idx, 'cumulative_return']
+    post_peak   = df[df['Date'] > peak_date]
+    trough_idx  = post_peak['CRI'].idxmin()
+    trough_date = df.loc[trough_idx, 'Date']
+    trough_ret  = df.loc[trough_idx, 'cumulative_return']
+    mdd_global     = peak_ret - trough_ret          # simple subtraction
+    dd_len_global  = (trough_date - peak_date).days
+    post_trough   = df[df['Date'] > trough_date]
+    recovered_g   = post_trough[post_trough['CRI'] >= df.loc[peak_idx, 'CRI']]
+    if not recovered_g.empty:
+        rec_date_g       = recovered_g.iloc[0]['Date']
+        rec_dur_global   = (rec_date_g - trough_date).days
+        total_dur_global = (rec_date_g - peak_date).days
+    else:
+        rec_date_g       = None
+        rec_dur_global   = None
+        total_dur_global = None
+    global_dd = {
+        'Peak Date':               peak_date.date(),
+        'Peak Cumulative Return':  round(peak_ret, 6),
+        'Trough Date':             trough_date.date(),
+        'Trough Cumulative Return':round(trough_ret, 6),
+        'Max Drawdown':            round(mdd_global, 6),
+        'Drawdown Length (days)':  dd_len_global,
+        'Recovery Date':           rec_date_g.date() if rec_date_g else None,
+        'Recovery Duration (days)':rec_dur_global,
+        'Total Duration (days)':   total_dur_global,
+    }
+    # -------------------------------------------------------------------------
+    # 2. All distinct drawdown episodes
+    # -------------------------------------------------------------------------
+    episodes = []
+    in_dd = False
+    ep_peak_idx = ep_trough_idx = None
+    ep_peak_val = ep_trough_val = None
+    for i, row in df.iterrows():
+        cri = row['CRI']
+        running_peak = df['CRI'][:i+1].max()
+        if not in_dd and cri < running_peak:
+            in_dd = True
+            ep_peak_idx = df['CRI'][:i+1].idxmax()
+            ep_peak_val = df.loc[ep_peak_idx, 'CRI']
+            ep_trough_idx = i
+            ep_trough_val = cri
+        elif in_dd:
+            if cri < ep_trough_val:
+                ep_trough_idx = i
+                ep_trough_val = cri
+            if cri >= ep_peak_val:          # fully recovered to a new peak
+                ep_peak_date   = df.loc[ep_peak_idx,   'Date']
+                ep_trough_date = df.loc[ep_trough_idx, 'Date']
+                ep_rec_date    = row['Date']
+                ep_peak_ret    = df.loc[ep_peak_idx,   'cumulative_return']
+                ep_trough_ret  = df.loc[ep_trough_idx, 'cumulative_return']
+                episodes.append({
+                    'Peak Date':               ep_peak_date.date(),
+                    'Trough Date':             ep_trough_date.date(),
+                    'Recovery Date':           ep_rec_date.date(),
+                    'Max Drawdown':            round(ep_peak_ret - ep_trough_ret, 6),
+                    'Drawdown Length (days)':  (ep_trough_date - ep_peak_date).days,
+                    'Recovery Duration (days)':(ep_rec_date - ep_trough_date).days,
+                    'Total Duration (days)':   (ep_rec_date - ep_peak_date).days,
+                })
+                in_dd = False
+    # Handle episode that has not yet recovered
+    if in_dd:
+        ep_peak_date   = df.loc[ep_peak_idx,   'Date']
+        ep_trough_date = df.loc[ep_trough_idx, 'Date']
+        ep_peak_ret    = df.loc[ep_peak_idx,   'cumulative_return']
+        ep_trough_ret  = df.loc[ep_trough_idx, 'cumulative_return']
+        episodes.append({
+            'Peak Date':               ep_peak_date.date(),
+            'Trough Date':             ep_trough_date.date(),
+            'Recovery Date':           None,
+            'Max Drawdown':            round(ep_peak_ret - ep_trough_ret, 6),
+            'Drawdown Length (days)':  (ep_trough_date - ep_peak_date).days,
+            'Recovery Duration (days)':None,
+            'Total Duration (days)':   None,
+        })
+    episodes_df = pd.DataFrame(episodes)
+    return episodes_df, global_dd
 
 def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_free_rate=0.0429):
     """
@@ -798,8 +920,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         risk_free_rate=risk_free_rate
     )
 
-    # ── NEW: append cost-basis columns to output before returning ──────────
     output = calculate_cost_basis(output, risk_free_rate)
-    # ── END NEW ────────────────────────────────────────────────────────────
- 
-    return output, metrics, bmark_filled, regression, ratios
+    # ── drawdown analysis ───────────────────────────────────────────────────
+    episodes_df, global_dd = calculate_drawdown(output)
+    return output, metrics, bmark_filled, regression, ratios, episodes_df, global_dd
