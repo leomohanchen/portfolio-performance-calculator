@@ -4,10 +4,12 @@ Portfolio Performance Calculator - Streamlit Web App
 
 import streamlit as st
 import pandas as pd
+import numpy as np
+from scipy import stats as scipy_stats
 from datetime import datetime, date
 import plotly.graph_objects as go
 import plotly.express as px
-from portfolio_calculator import run_full_analysis
+from portfolio_calculator import run_full_analysis, calculate_var_cvar
 import warnings
 import tempfile
 import os
@@ -66,6 +68,30 @@ risk_free_rate = st.sidebar.number_input(
 ) / 100
 # ── END NEW ──────────────────────────────────────────────────────────────────
 
+# ── VaR / CVaR Settings ──────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("VaR / CVaR Settings")
+
+var_confidence_levels = st.sidebar.multiselect(
+    "Confidence Levels",
+    options=[0.90, 0.95, 0.99],
+    default=[0.95, 0.99],
+    format_func=lambda x: f"{x:.0%}",
+    help="Confidence levels for VaR and CVaR calculation"
+)
+if not var_confidence_levels:
+    var_confidence_levels = [0.95, 0.99]
+
+var_custom_horizon = st.sidebar.number_input(
+    "Custom Horizon (days)",
+    min_value=1,
+    max_value=252,
+    value=30,
+    step=1,
+    help="Custom horizon in addition to the standard 1-day and 10-day (Basel III). Max 252 = 1 trading year."
+)
+var_horizons = sorted(set([1, 10, int(var_custom_horizon)]))
+
 # Run analysis button
 run_analysis = st.sidebar.button("Calculate Performance", type="primary")
 
@@ -79,7 +105,7 @@ if uploaded_file is not None and run_analysis:
                 temp_file_path = tmp_file.name
 
             # ── CHANGED — now returns 7 values ───────────────────────────────
-            output_df, metrics, bmark_filled, regression, ratios, episodes_df, global_dd = run_full_analysis(
+            output_df, metrics, bmark_filled, regression, ratios, episodes_df, global_dd, var_results, var_diagnostics = run_full_analysis(
                 temp_file_path,
                 end_date,
                 benchmark_ticker=benchmark_ticker,
@@ -90,7 +116,7 @@ if uploaded_file is not None and run_analysis:
             st.success("✅ Analysis Complete!")
 
             # ── TOP-LEVEL PAGE NAVIGATION ─────────────────────────────────────
-            tab_main, tab_drawdown = st.tabs(["📊 Performance Overview", "📉 Drawdown Analysis"])
+            tab_main, tab_drawdown, tab_var = st.tabs(["📊 Performance Overview", "📉 Drawdown Analysis", "⚠️ Value at Risk"])
 
             # =================================================================
             # TAB 1: PERFORMANCE OVERVIEW  (all existing sections)
@@ -550,6 +576,250 @@ if uploaded_file is not None and run_analysis:
 
                 else:
                     st.info("No drawdown episodes found — the portfolio has been in continuous growth.")
+
+            # =================================================================
+            # TAB 3: VALUE AT RISK
+            # =================================================================
+            with tab_var:
+
+
+                st.header("⚠️ Value at Risk (VaR) & Conditional Value at Risk (CVaR)")
+                st.markdown(
+                    "Risk estimates based on your portfolio's **daily time-weighted returns**. "
+                    "Two methods are shown: Historical Simulation (no assumptions) and "
+                    "Parametric Student-t (MLE-fitted fat-tail distribution)."
+                )
+
+                # ── Recalculate with user-selected settings ───────────────────
+                var_results_user, var_diag = calculate_var_cvar(
+                    output_df['Subperiod_Return'],
+                    confidence_levels=var_confidence_levels,
+                    horizons=var_horizons,
+                )
+                var_df = pd.DataFrame(var_results_user)
+
+                # ── PART A: DISTRIBUTION DIAGNOSTICS ─────────────────────────
+                st.subheader("📐 Return Distribution Diagnostics")
+
+                col1, col2, col3, col4, col5 = st.columns(5)
+                col1.metric("Observations",     var_diag['n_observations'])
+                col2.metric("Daily Mean",        f"{var_diag['mean']:.4%}")
+                col3.metric("Daily Std Dev",     f"{var_diag['std']:.4%}")
+                col4.metric("Skewness",          f"{var_diag['skewness']:.4f}")
+                col5.metric("Excess Kurtosis",   f"{var_diag['excess_kurtosis']:.4f}")
+
+                with st.expander("ℹ️ What do these diagnostics tell us?"):
+                    st.markdown(f"""
+                    **Skewness** measures the asymmetry of the return distribution.
+                    - Zero = symmetric (like a normal distribution)
+                    - Negative = left-skewed — losses tend to be more extreme than gains
+                    - Your portfolio skewness: **{var_diag['skewness']:.4f}**
+
+                    **Excess Kurtosis** measures how fat the tails are relative to a normal distribution.
+                    - Zero = normal distribution tails
+                    - Positive = fat tails — extreme events (both gains and losses) happen more often than normal predicts
+                    - Your portfolio excess kurtosis: **{var_diag['excess_kurtosis']:.4f}**
+                    - Values above 1 strongly suggest the normal distribution would *underestimate* tail risk
+
+                    **Fitted Student-t Parameters (MLE)**
+                    - Degrees of freedom: **{var_diag['t_dof']:.4f}** — lower = fatter tails (normal ≈ dof > 30)
+                    - Location: **{var_diag['t_loc']:.6f}** — centre of the fitted distribution
+                    - Scale: **{var_diag['t_scale']:.6f}** — spread of the fitted distribution
+                    """)
+
+                st.markdown("---")
+
+                # ── PART B: HISTOGRAM WITH VaR / CVaR MARKERS ────────────────
+                st.subheader("📊 Return Distribution with VaR & CVaR")
+
+                returns_clean = output_df['Subperiod_Return'].dropna() * 100  # convert to %
+
+                # Build histogram
+                fig_hist = go.Figure()
+
+                fig_hist.add_trace(go.Histogram(
+                    x=returns_clean,
+                    nbinsx=60,
+                    name='Daily Returns',
+                    marker_color='rgba(31, 119, 180, 0.6)',
+                    marker_line=dict(color='rgba(31, 119, 180, 1.0)', width=0.5),
+                ))
+
+                # Overlay fitted Student-t PDF
+                x_range = np.linspace(returns_clean.min(), returns_clean.max(), 300)
+                dof_fit  = var_diag['t_dof']
+                loc_fit  = var_diag['t_loc'] * 100
+                scale_fit= var_diag['t_scale'] * 100
+
+                # Scale PDF to match histogram height
+                bin_width  = (returns_clean.max() - returns_clean.min()) / 60
+                n_obs      = len(returns_clean)
+                pdf_scaled = scipy_stats.t.pdf(x_range, dof_fit, loc_fit, scale_fit) * n_obs * bin_width
+
+                fig_hist.add_trace(go.Scatter(
+                    x=x_range,
+                    y=pdf_scaled,
+                    mode='lines',
+                    name=f'Fitted Student-t (dof={dof_fit:.2f})',
+                    line=dict(color='#ff7f0e', width=2),
+                ))
+
+                # Colour palette for confidence levels
+                cl_colours = {0.90: ('#9467bd', '#c5b0d5'), 0.95: ('#d62728', '#ff9896'), 0.99: ('#8c564b', '#c49c94')}
+
+                # Add VaR and CVaR vertical lines for each confidence level — Historical only on histogram
+                for cl in var_confidence_levels:
+                    cl_pct   = f'{cl:.0%}'
+                    col_dark, col_light = cl_colours.get(cl, ('#333333', '#aaaaaa'))
+
+                    hist_row = var_df[(var_df['Confidence Level'] == cl) &
+                                     (var_df['Method'] == 'Historical Simulation') &
+                                     (var_df['Horizon (days)'] == 1)]
+                    t_row    = var_df[(var_df['Confidence Level'] == cl) &
+                                     (var_df['Method'] == 'Parametric (Student-t)') &
+                                     (var_df['Horizon (days)'] == 1)]
+
+                    if not hist_row.empty:
+                        var_h  = hist_row.iloc[0]['VaR (%)']
+                        cvar_h = hist_row.iloc[0]['CVaR (%)']
+                        # Historical VaR — solid line
+                        fig_hist.add_shape(type='line', x0=var_h, x1=var_h, y0=0, y1=1,
+                                           xref='x', yref='paper',
+                                           line=dict(color=col_dark, width=2, dash='solid'))
+                        fig_hist.add_annotation(x=var_h, y=0.97, xref='x', yref='paper',
+                                                text=f'Hist VaR {cl_pct}', showarrow=False,
+                                                font=dict(color=col_dark, size=10),
+                                                xanchor='right', yanchor='top')
+                        # Historical CVaR — dashed line
+                        fig_hist.add_shape(type='line', x0=cvar_h, x1=cvar_h, y0=0, y1=1,
+                                           xref='x', yref='paper',
+                                           line=dict(color=col_dark, width=2, dash='dash'))
+                        fig_hist.add_annotation(x=cvar_h, y=0.88, xref='x', yref='paper',
+                                                text=f'Hist CVaR {cl_pct}', showarrow=False,
+                                                font=dict(color=col_dark, size=10),
+                                                xanchor='right', yanchor='top')
+
+                    if not t_row.empty:
+                        var_t  = t_row.iloc[0]['VaR (%)']
+                        cvar_t = t_row.iloc[0]['CVaR (%)']
+                        # Parametric VaR — solid line, lighter shade
+                        fig_hist.add_shape(type='line', x0=var_t, x1=var_t, y0=0, y1=1,
+                                           xref='x', yref='paper',
+                                           line=dict(color=col_light, width=2, dash='solid'))
+                        fig_hist.add_annotation(x=var_t, y=0.79, xref='x', yref='paper',
+                                                text=f't-VaR {cl_pct}', showarrow=False,
+                                                font=dict(color=col_dark, size=10),
+                                                xanchor='right', yanchor='top')
+                        # Parametric CVaR — dashed line, lighter shade
+                        fig_hist.add_shape(type='line', x0=cvar_t, x1=cvar_t, y0=0, y1=1,
+                                           xref='x', yref='paper',
+                                           line=dict(color=col_light, width=2, dash='dash'))
+                        fig_hist.add_annotation(x=cvar_t, y=0.70, xref='x', yref='paper',
+                                                text=f't-CVaR {cl_pct}', showarrow=False,
+                                                font=dict(color=col_dark, size=10),
+                                                xanchor='right', yanchor='top')
+
+                fig_hist.update_layout(
+                    title='Daily Return Distribution — Historical vs Fitted Student-t',
+                    xaxis_title='Daily Return (%)',
+                    yaxis_title='Frequency',
+                    template='plotly_white',
+                    height=500,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+                    bargap=0.05,
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+                with st.expander("ℹ️ How to read this chart"):
+                    st.markdown("""
+                    **Blue bars** — the actual distribution of your daily portfolio returns.
+
+                    **Orange curve** — the Student-t distribution fitted to your returns via Maximum
+                    Likelihood Estimation (MLE). Where it rises above the bars, the model predicts
+                    more events than actually occurred; where it falls below, it predicts fewer.
+
+                    **Vertical lines** — VaR and CVaR thresholds for each confidence level.
+                    Solid lines = VaR. Dashed lines = CVaR (always further left = larger loss).
+                    Dark shades = Historical Simulation. Light shades = Parametric Student-t.
+
+                    Returns to the **left** of a VaR line represent the worst outcomes —
+                    the proportion of days beyond VaR equals (1 − confidence level).
+                    """)
+
+                st.markdown("---")
+
+                # ── PART C: RESULTS TABLES PER HORIZON ───────────────────────
+                st.subheader("📋 VaR & CVaR Results")
+                st.markdown(
+                    "Results shown for each selected horizon. "
+                    "Negative values represent losses as a percentage of portfolio value."
+                )
+
+                for h in var_horizons:
+                    st.markdown(f"**{h}-day Horizon**")
+                    h_df = (
+                        var_df[var_df['Horizon (days)'] == h]
+                        [['Confidence Level Pct', 'Method', 'VaR (%)', 'CVaR (%)']]
+                        .assign(**{
+                            'VaR (%)':  lambda d: d['VaR (%)'].map('{:.2f}%'.format),
+                            'CVaR (%)': lambda d: d['CVaR (%)'].map('{:.2f}%'.format),
+                        })
+                        .rename(columns={'Confidence Level Pct': 'Confidence'})
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(h_df, use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+
+                # ── PART D: METHODOLOGY FOOTNOTES ────────────────────────────
+                with st.expander("📖 Methodology & Interpretation Guide"):
+                    st.markdown(f"""
+                    ### What is VaR?
+                    **Value at Risk (VaR)** answers: *"What is the maximum loss I would not expect to
+                    exceed on a given day, at a chosen confidence level?"*
+
+                    For example, a **95% 1-day VaR of −1.5%** means: on 95 out of 100 trading days,
+                    your portfolio is not expected to lose more than 1.5%. The remaining 5% of days
+                    may produce losses worse than this.
+
+                    ### What is CVaR?
+                    **Conditional VaR (CVaR)**, also called Expected Shortfall, answers: *"Given that
+                    losses exceed VaR, what is the average loss?"*
+
+                    CVaR is always larger in magnitude than VaR at the same confidence level. It is
+                    considered the superior metric because VaR says nothing about how bad losses can
+                    get beyond the threshold — CVaR fills that gap.
+
+                    ### Method 1 — Historical Simulation
+                    - Takes your actual daily returns and reads off the empirical percentile directly
+                    - **No distributional assumptions** — if your returns had fat tails or skewness, this captures it automatically
+                    - Weakness: limited to scenarios that have already occurred in your sample
+
+                    ### Method 2 — Parametric Student-t
+                    - Fits a Student-t distribution to your returns using **Maximum Likelihood Estimation (MLE)**
+                    - The Student-t has heavier tails than the normal distribution, controlled by degrees of freedom
+                    - Fitted degrees of freedom: **{var_diag['t_dof']:.2f}** (lower = fatter tails; normal ≈ dof > 30)
+                    - Allows VaR/CVaR to be computed analytically, including scenarios beyond what has been observed
+                    - Weakness: still assumes a parametric shape that may not perfectly match your data
+
+                    ### Horizon Scaling
+                    Both methods compute 1-day VaR/CVaR first, then scale to longer horizons using the
+                    **square root of time rule**: VaR(h days) = VaR(1 day) × √h.
+                    This is the Basel III standard for regulatory capital calculation.
+                    It assumes returns are independent and identically distributed across days — an approximation
+                    that works well for moderate horizons but may underestimate risk over very long periods
+                    when volatility clustering (GARCH effects) is present.
+
+                    ### Confidence Levels
+                    - **95%** — standard for internal daily risk monitoring
+                    - **99%** — Basel III regulatory capital standard for market risk
+                    - **90%** — sometimes used for less conservative internal limits
+
+                    ### Ex-Ante Nature
+                    VaR and CVaR are **ex-ante** (forward-looking) metrics. Even though they are calculated
+                    from historical data, their purpose is to estimate the risk of future losses. They should
+                    be recalculated regularly as market conditions evolve.
+                    """)
 
             # Clean up temporary file
             try:

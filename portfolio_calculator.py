@@ -798,6 +798,114 @@ def calculate_drawdown(output_df):
     episodes_df = pd.DataFrame(episodes)
     return episodes_df, global_dd
 
+def fit_t_robust(returns):
+    """
+    Fit Student-t distribution via MLE with constrained degrees of freedom.
+    Constraining dof to [2.01, 30] prevents degenerate solutions when
+    kurtosis is extreme:
+      - dof <= 2 implies infinite variance (CVaR formula breaks down)
+      - dof > 30 is statistically indistinguishable from normal
+    Uses method-of-moments estimate as initial guess for dof.
+    """
+    from scipy.optimize import minimize
+    from scipy import stats
+ 
+    def neg_loglik(params):
+        dof, loc, scale = params
+        if scale <= 0 or dof <= 2:
+            return np.inf
+        return -stats.t.logpdf(returns, dof, loc, scale).sum()
+ 
+    kurt     = returns.kurt()
+    dof_init = max(2.5, min(30, 4 + 6 / kurt)) if kurt > 0 else 5.0
+ 
+    result = minimize(
+        neg_loglik,
+        x0=[dof_init, returns.mean(), returns.std()],
+        bounds=[(2.01, 30), (None, None), (1e-6, None)],
+        method='L-BFGS-B'
+    )
+    return result.x  # dof, loc, scale
+ 
+ 
+def calculate_var_cvar(returns, confidence_levels=[0.95, 0.99], horizons=[1, 10]):
+    """
+    Calculate VaR and CVaR using two industry-standard methods:
+      1. Historical Simulation  — no distributional assumption, uses empirical data directly
+      2. Parametric (Student-t) — fits a t-distribution via MLE with constrained dof
+ 
+    Results scaled to each requested horizon via square root of time rule (Basel III).
+    VaR and CVaR expressed as percentages (e.g. -1.23 means a loss of 1.23%).
+ 
+    Parameters
+    ----------
+    returns           : pd.Series of daily portfolio returns (e.g. Subperiod_Return)
+    confidence_levels : list of floats, e.g. [0.95, 0.99]
+    horizons          : list of ints, horizon in days, e.g. [1, 10, 30]
+ 
+    Returns
+    -------
+    results     : list of dicts — one row per (confidence level, method, horizon)
+    diagnostics : dict — fitted t-distribution parameters and return series statistics
+    """
+    from scipy import stats
+ 
+    returns = returns.dropna()
+ 
+    diagnostics = {
+        'n_observations':  len(returns),
+        'mean':            returns.mean(),
+        'std':             returns.std(),
+        'skewness':        returns.skew(),
+        'excess_kurtosis': returns.kurt(),
+        'min':             returns.min(),
+        'max':             returns.max(),
+    }
+ 
+    dof, loc, scale = fit_t_robust(returns)
+    diagnostics['t_dof']   = dof
+    diagnostics['t_loc']   = loc
+    diagnostics['t_scale'] = scale
+ 
+    results = []
+ 
+    for cl in confidence_levels:
+        alpha = 1 - cl
+ 
+        # Historical Simulation
+        var_hist_1d  = np.percentile(returns, alpha * 100)
+        cvar_hist_1d = returns[returns <= var_hist_1d].mean()
+ 
+        # Parametric Student-t
+        z         = stats.t.ppf(alpha, dof)
+        var_t_1d  = stats.t.ppf(alpha, dof, loc, scale)
+        pdf_z     = stats.t.pdf(z, dof)
+        cvar_t_1d = loc - scale * (pdf_z / alpha) * ((dof + z**2) / (dof - 1))
+ 
+        for h in horizons:
+            scale_factor = np.sqrt(h)
+ 
+            results.append({
+                'Confidence Level':     cl,
+                'Confidence Level Pct': f'{cl:.0%}',
+                'Method':               'Historical Simulation',
+                'Horizon (days)':       h,
+                'Horizon Label':        f'{h}-day',
+                'VaR (%)':              var_hist_1d  * scale_factor * 100,
+                'CVaR (%)':             cvar_hist_1d * scale_factor * 100,
+            })
+            results.append({
+                'Confidence Level':     cl,
+                'Confidence Level Pct': f'{cl:.0%}',
+                'Method':               'Parametric (Student-t)',
+                'Horizon (days)':       h,
+                'Horizon Label':        f'{h}-day',
+                'VaR (%)':              var_t_1d  * scale_factor * 100,
+                'CVaR (%)':             cvar_t_1d * scale_factor * 100,
+            })
+ 
+    return results, diagnostics
+
 def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_free_rate=0.0429):
     """
     Run the complete portfolio analysis pipeline including benchmark comparison,
@@ -837,7 +945,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         - cumulative_return : compounded return from inception
         - [TICKER]_Holdings : units held for each security
         - [TICKER]_Price : closing price for each security
-
+ 
     metrics : dict
         Overall portfolio performance metrics:
         - twrr_total : total return from inception to end_date
@@ -846,7 +954,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         - start_date : date of first transaction
         - end_date : end date of analysis
         - days : total number of calendar days in analysis period
-
+ 
     bmark_filled : pandas.DataFrame
         Day-by-day benchmark analysis simulating the same cash flow timing
         as the actual portfolio, with the following key columns:
@@ -858,7 +966,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         - benchmark_market_value_beginning : benchmark value at start of day
         - benchmark_returns : daily benchmark TWRR return
         - cumulative_return : compounded benchmark return from inception
-
+ 
     regression : dict
         OLS regression results of portfolio returns on benchmark returns:
         - alpha : daily Jensen's alpha (intercept)
@@ -868,7 +976,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         - p_value_alpha : statistical significance of alpha (< 0.05 = significant)
         - p_value_beta : statistical significance of beta
         - summary : full statsmodels OLS summary object
-
+ 
     ratios : dict
         Risk-adjusted performance ratios:
         - sharpe_ratio : excess return per unit of total volatility
@@ -885,7 +993,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         - tracking_error : annualised volatility of active returns
         - ann_downside_vol : annualised downside deviation (full sample)
         - ann_residual_vol : annualised volatility of residual returns
-
+ 
     Example:
     --------
     >>> output, metrics, bmark_filled, regression, ratios = run_full_analysis(
@@ -903,7 +1011,7 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         end_date = datetime.today()
     elif isinstance(end_date, str):
         end_date = pd.to_datetime(end_date, dayfirst=True)
-
+ 
     filtered_transactions = clean_transactions_data(file_path)
     daily_cash_flow = daily_net_cash_flow(filtered_transactions)
     accumulated_holding = accumulated_holdings_data(filtered_transactions)
@@ -919,8 +1027,14 @@ def run_full_analysis(file_path, end_date=None, benchmark_ticker='VGS.AX', risk_
         beta=regression['beta'],
         risk_free_rate=risk_free_rate
     )
-
+ 
     output = calculate_cost_basis(output, risk_free_rate)
     # ── drawdown analysis ───────────────────────────────────────────────────
     episodes_df, global_dd = calculate_drawdown(output)
-    return output, metrics, bmark_filled, regression, ratios, episodes_df, global_dd
+    # ── VaR / CVaR — defaults: 95%/99% confidence, 1-day and 10-day horizons
+    var_results, var_diagnostics = calculate_var_cvar(
+        output['Subperiod_Return'],
+        confidence_levels=[0.95, 0.99],
+        horizons=[1, 10]
+    )
+    return output, metrics, bmark_filled, regression, ratios, episodes_df, global_dd, var_results, var_diagnostics
