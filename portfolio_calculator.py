@@ -9,6 +9,19 @@ from datetime import date, datetime
 import yfinance as yf
 import statsmodels.api as sm
 
+
+# ── [FIX] Datetime precision normaliser ──────────────────────────────────────
+# pandas 2.0+ and yfinance can produce datetime64[s] vs datetime64[us] columns.
+# Any merge between them raises a MergeError.  This helper coerces all Date
+# columns to datetime64[us] so every merge/merge_asof in the pipeline is safe.
+def _norm_dates(df, col='Date'):
+    """Return a copy of df with the named column cast to datetime64[us]."""
+    df = df.copy()
+    df[col] = pd.to_datetime(df[col]).astype('datetime64[us]')
+    return df
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def clean_transactions_data(file_path):
     """
     Clean and standardize transactions data from Commsec
@@ -169,6 +182,9 @@ def fill_portfolio_dates(df, end_date, add_ax_suffix=True):
             columns=lambda x: f'{x}.AX' if (x != 'Date' and not x.endswith('.AX')) else x
         )
 
+    # [FIX] Normalise Date precision so downstream merges never hit a
+    # datetime64[s] vs datetime64[us] MergeError (pandas 2.0+ / yfinance)
+    df_filled = _norm_dates(df_filled)
     return df_filled
     
 
@@ -264,7 +280,10 @@ def benchmark_data(filled_close_prices, filtered_transactions, benchmark_ticker=
 
     # Get daily net cash flows from actual transactions (same as your portfolio)
     daily_cf = daily_net_cash_flow(filtered_transactions)
-    daily_cf['Date'] = pd.to_datetime(daily_cf['Date'])
+    # [FIX] Normalise both sides to datetime64[us] before merge_asof so pandas
+    # 2.0+ doesn't raise "incompatible merge keys" on [s] vs [us] precision
+    daily_cf = _norm_dates(daily_cf)
+    data = _norm_dates(data)
 
     # Merge cash flows with benchmark prices on transaction dates
     # Use merge_asof to match each transaction date to the nearest available
@@ -319,7 +338,8 @@ def benchmark_data(filled_close_prices, filtered_transactions, benchmark_ticker=
     # -------------------------------------------------------------------------
     bmark_filled = pd.merge(
         bmark_filled,
-        daily_cf[['Date', 'net_cash_flow']],
+        # [FIX] Re-normalise daily_cf Date precision before this second merge
+        _norm_dates(daily_cf[['Date', 'net_cash_flow']]),
         on='Date',
         how='left'
     )
@@ -390,7 +410,12 @@ def calculate_portfolio_value(daily_cash_flow, filled_holdings, filled_close_pri
     result['Market_Value_End'] = total_value
     
     result = result.reset_index()
-    
+
+    # [FIX] Normalise Date precision on both sides before merging — pandas 2.0+
+    # can produce datetime64[s] from yfinance and datetime64[us] from CSV parsing
+    daily_cash_flow = _norm_dates(daily_cash_flow)
+    result = _norm_dates(result)
+
     merged_dataset = pd.merge(
         daily_cash_flow, 
         result, 
